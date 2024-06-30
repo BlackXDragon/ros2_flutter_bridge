@@ -71,16 +71,13 @@ class Ros2FlutterBridge(Node):
             f['name'] = field[0]
             f['type'] = field[1]
             f['value'] = getattr(msg, field[0])
-            print(f['name'], f['type'], f['value'])
             if f['type'] not in ROS2NativeTypes:
                 if f['type'].endswith(']'):
                     f['type'] = f['type'].split('[')[0] + '[]'
                     f['value'] = list(f['value'])
-                    print(f['name'], f['type'], f['value'])
                 elif f['type'].startswith('sequence'):
                     f['type'] = f['type'].split('<')[1].split('>')[0] + '[]'
                     f['value'] = list(f['value'])
-                    print(f['name'], f['type'], f['value'])
                 else:
                     f['value'] = self.ros2_msg_to_dict(f['value'])
             msg_data['fields'].append(f)
@@ -120,7 +117,6 @@ class Ros2FlutterBridge(Node):
             try:
                 message = await self.ws.recv()
                 data = json.loads(message)
-                self.get_logger().info(f"Received: {data}")
                 if data['op'] == 'create_publisher':
                     if data['topic'] not in self.pubs:
                         msgType = data['message_type']['name'].split('/')
@@ -154,12 +150,6 @@ class Ros2FlutterBridge(Node):
                 elif data['op'] == 'send_goal':
                     if data['action_server'] in self.action_clients:
                         client, actionType, actionTypeStruct = self.action_clients[data['action_server']]
-                        # goal_data = {}
-                        # for field in data['goal']['fields']:
-                        #     goal_data[field['name']] = field['value']
-                        # goal = actionType.Goal()
-                        # for field in goal_data:
-                        #     setattr(goal, field, goal_data[field])
                         goalType = actionType.Goal
                         goal = self.dict_to_ros2_msg(data['goal'], goalType)
                         try:
@@ -173,9 +163,36 @@ class Ros2FlutterBridge(Node):
                             future.add_done_callback(partial(self.on_goal_response, data['action_server'], data['tempGoalID'], actionTypeStruct))
                             if data['action_server'] not in self.sent_goals:
                                 self.sent_goals[data['action_server']] = {}
-                            self.sent_goals[data['action_server']][data['tempGoalID']] = {'goalID': None, 'handle': None}
+                            self.sent_goals[data['action_server']][data['tempGoalID']] = {'goalID': None, 'handle': None, 'cancelled': False}
                         except Exception as e:
                             await self.ws.send(json.dumps({'op': 'error', 'message': str(e), 'traceback': format_exc()}))
+                    else:
+                        await self.ws.send(json.dumps({'op': 'error', 'message': 'Action client does not exist'}))
+                elif data['op'] == 'cancel_goal':
+                    if data['action_server'] in self.action_clients:
+                        goals = self.sent_goals[data['action_server']]
+                        goal_handle = None
+                        if data['goalID'] in goals:
+                            goal = goals[data['goalID']]
+                            goal_handle = goal['handle']
+                        elif data['goalID'] in [g['goalID'] for g in goals.values()]:
+                            goal = [g for g in goals.values() if g['goalID'] == data['goalID']][0]
+                            goal_handle = goal['handle']
+                        else:
+                            await self.ws.send(json.dumps({'op': 'error', 'message': 'Goal not found'}))
+                        if goal_handle:
+                            goal['cancelled'] = True
+                            res = goal_handle.cancel_goal()
+                            if res.return_code != 0:
+                                goal['cancelled'] = False
+                            await self.ws.send(json.dumps({
+                                'op': 'action_cancel_response',
+                                'goalID': data['goalID'],
+                                'action_server': data['action_server'],
+                                'success': res.return_code == 0
+                                }))
+                        else:
+                            await self.ws.send(json.dumps({'op': 'error', 'message': 'Goal exists but has not been accepted yet'}))
                     else:
                         await self.ws.send(json.dumps({'op': 'error', 'message': 'Action client does not exist'}))
                 else:
@@ -206,7 +223,9 @@ class Ros2FlutterBridge(Node):
             await self.ws.send(json.dumps(data))
             
     async def on_action_feedback(self, action_server, goalID, actionTypeStruct, feedback):
-        self.get_logger().info("Action feedback received")
+        if self.sent_goals[action_server][goalID]['cancelled']:
+            return
+        
         feedback_data = self.ros2_msg_to_dict(feedback.feedback)
         feedback_data['name'] = actionTypeStruct['feedback']['name']
         
@@ -224,7 +243,6 @@ class Ros2FlutterBridge(Node):
             await self.ws.send(json.dumps(data))
             
     async def on_goal_response(self, action_server, goalID, actionTypeStruct, future):
-        self.get_logger().info("Goal response received")
         goal_handle = future.result()
         uuid = goal_handle.goal_id.uuid
         uuid_str = ''.join(['%02x' % i for i in uuid])
@@ -247,16 +265,18 @@ class Ros2FlutterBridge(Node):
         if self.ws:
             await self.ws.send(json.dumps(data))
         future = goal_handle.get_result_async()
-        future.add_done_callback(partial(self.on_goal_result, action_server, uuid_str, actionTypeStruct))
+        future.add_done_callback(partial(self.on_goal_result, action_server, goalID, actionTypeStruct))
         
     async def on_goal_result(self, action_server, goalID, actionTypeStruct, future):
-        self.get_logger().info("Goal result received")
+        if self.sent_goals[action_server][goalID]['cancelled']:
+            return
+        
         result = future.result()
         result_data = self.ros2_msg_to_dict(result.result)
         result_data['name'] = actionTypeStruct['result']['name']
         data = {
             'op': 'action_result',
-            'goalID': goalID,
+            'goalID': self.sent_goals[action_server][goalID]['goalID'],
             'action_server': action_server,
             'result': result_data
         }
