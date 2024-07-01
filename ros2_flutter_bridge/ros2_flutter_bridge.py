@@ -164,6 +164,12 @@ class Ros2FlutterBridge(Node):
                             if data['action_server'] not in self.sent_goals:
                                 self.sent_goals[data['action_server']] = {}
                             self.sent_goals[data['action_server']][data['tempGoalID']] = {'goalID': None, 'handle': None, 'cancelled': False}
+                            await self.ws.send(json.dumps({
+                                'op': 'goal_status',
+                                'goalID': data['tempGoalID'],
+                                'action_server': data['action_server'],
+                                'status': 'pending',
+                                }))
                         except Exception as e:
                             await self.ws.send(json.dumps({'op': 'error', 'message': str(e), 'traceback': format_exc()}))
                     else:
@@ -190,6 +196,12 @@ class Ros2FlutterBridge(Node):
                                 'goalID': data['goalID'],
                                 'action_server': data['action_server'],
                                 'success': res.return_code == 0
+                                }))
+                            await self.ws.send(json.dumps({
+                                'op': 'goal_status',
+                                'goalID': data['goalID'],
+                                'action_server': data['action_server'],
+                                'status': 'canceled' if res.return_code == 0 else 'cancel_rejected',
                                 }))
                         else:
                             await self.ws.send(json.dumps({'op': 'error', 'message': 'Goal exists but has not been accepted yet'}))
@@ -244,6 +256,16 @@ class Ros2FlutterBridge(Node):
             
     async def on_goal_response(self, action_server, goalID, actionTypeStruct, future):
         goal_handle = future.result()
+        if not goal_handle.accepted:
+            data = {
+                'op': 'goal_status',
+                'goalID': goalID,
+                'action_server': action_server,
+                'status': 'rejected',
+            }
+            if self.ws:
+                await self.ws.send(json.dumps(data))
+            return
         uuid = goal_handle.goal_id.uuid
         uuid_str = ''.join(['%02x' % i for i in uuid])
         self.sent_goals[action_server][goalID]['goalID'] = uuid_str
@@ -257,10 +279,10 @@ class Ros2FlutterBridge(Node):
         if self.ws:
             await self.ws.send(json.dumps(data))
         data = {
-            'op': 'goal_response',
+            'op': 'goal_status',
             'goalID': uuid_str,
             'action_server': action_server,
-            'accepted': goal_handle.accepted
+            'status': 'active',
         }
         if self.ws:
             await self.ws.send(json.dumps(data))
@@ -272,6 +294,19 @@ class Ros2FlutterBridge(Node):
             return
         
         result = future.result()
+        
+        if result.status != 5:
+            # Goal aborted
+            data = {
+                'op': 'goal_status',
+                'goalID': self.sent_goals[action_server][goalID]['goalID'],
+                'action_server': action_server,
+                'status': 'aborted',
+            }
+            if self.ws:
+                await self.ws.send(json.dumps(data))
+            return
+        
         result_data = self.ros2_msg_to_dict(result.result)
         result_data['name'] = actionTypeStruct['result']['name']
         data = {
@@ -279,6 +314,14 @@ class Ros2FlutterBridge(Node):
             'goalID': self.sent_goals[action_server][goalID]['goalID'],
             'action_server': action_server,
             'result': result_data
+        }
+        if self.ws:
+            await self.ws.send(json.dumps(data))
+        data = {
+            'op': 'goal_status',
+            'goalID': self.sent_goals[action_server][goalID]['goalID'],
+            'action_server': action_server,
+            'status': 'completed',
         }
         if self.ws:
             await self.ws.send(json.dumps(data))
