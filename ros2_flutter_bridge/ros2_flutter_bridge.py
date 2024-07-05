@@ -16,10 +16,13 @@ from traceback import print_exc, format_exc
 
 ROS2NativeTypes = [
     'bool',
+    'boolean',
     'byte',
     'char',
+    'float',
     'float32',
     'float64',
+    'int',
     'int8',
     'uint8',
     'int16',
@@ -80,6 +83,8 @@ class Ros2FlutterBridge(Node):
                     f['value'] = list(f['value'])
                 else:
                     f['value'] = self.ros2_msg_to_dict(f['value'])
+            if f['type'] == 'boolean':
+                f['type'] = 'bool'
             msg_data['fields'].append(f)
         msg_data['name'] = msg.__class__.__name__
         return msg_data
@@ -93,6 +98,32 @@ class Ros2FlutterBridge(Node):
             if not any([field['type'].startswith(t) for t in ROS2NativeTypes]):
                 setattr(msg, field['name'], self.dict_to_ros2_msg(field['value']))
             else:
+                if field['type'].endswith(']'):
+                    if 'float' in field['type']:
+                        field['value'] = [float(v) for v in field['value']]
+                    elif 'int' in field['type']:
+                        field['value'] = [int(v) for v in field['value']]
+                    elif field['type'] == 'bool':
+                        field['value'] = [bool(v) for v in field['value']]
+                    elif field['type'] == 'string':
+                        field['value'] = [str(v) for v in field['value']]
+                elif field['type'].startswith('sequence'):
+                    if 'float' in field['type']:
+                        field['value'] = [float(v) for v in field['value']]
+                    elif 'int' in field['type']:
+                        field['value'] = [int(v) for v in field['value']]
+                    elif field['type'] == 'bool':
+                        field['value'] = [bool(v) for v in field['value']]
+                    elif field['type'] == 'string':
+                        field['value'] = [str(v) for v in field['value']]
+                elif 'float' in field['type']:
+                    field['value'] = float(field['value'])
+                elif 'int' in field['type']:
+                    field['value'] = int(field['value'])
+                elif field['type'] == 'bool':
+                    field['value'] = bool(field['value'])
+                elif field['type'] == 'string':
+                    field['value'] = str(field['value'])
                 setattr(msg, field['name'], field['value'])
         return msg
         
@@ -295,7 +326,7 @@ class Ros2FlutterBridge(Node):
         
         result = future.result()
         
-        if result.status != 5:
+        if result.status == 6:
             # Goal aborted
             data = {
                 'op': 'goal_status',
@@ -303,6 +334,7 @@ class Ros2FlutterBridge(Node):
                 'action_server': action_server,
                 'status': 'aborted',
             }
+            print("Goal aborted")
             if self.ws:
                 await self.ws.send(json.dumps(data))
             return
