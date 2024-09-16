@@ -4,6 +4,10 @@ from rclpy.executors import MultiThreadedExecutor
 
 from rclpy.action import ActionServer, ActionClient
 
+from rclpy.parameter import Parameter
+from rclpy.exceptions import ParameterNotDeclaredException
+from rcl_interfaces.srv import SetParameters
+
 import websockets
 import asyncio
 import threading
@@ -20,6 +24,7 @@ ROS2NativeTypes = [
     'byte',
     'char',
     'float',
+    'double',
     'float32',
     'float64',
     'int',
@@ -85,6 +90,8 @@ class Ros2FlutterBridge(Node):
                     f['value'] = self.ros2_msg_to_dict(f['value'])
             if f['type'] == 'boolean':
                 f['type'] = 'bool'
+            if 'double' in f['type']:
+                f['type'] = f['type'].replace('double', 'float64')
             msg_data['fields'].append(f)
         msg_data['name'] = msg.__class__.__name__
         return msg_data
@@ -126,6 +133,28 @@ class Ros2FlutterBridge(Node):
                     field['value'] = str(field['value'])
                 setattr(msg, field['name'], field['value'])
         return msg
+    
+    def strToParamType(self, paramType):
+        if paramType == 'bool':
+            return Parameter.Type.BOOL
+        elif paramType == 'int64':
+            return Parameter.Type.INTEGER
+        elif paramType == 'float64':
+            return Parameter.Type.DOUBLE
+        elif paramType == 'string':
+            return Parameter.Type.STRING
+        elif paramType == 'byte_array':
+            return Parameter.Type.BYTE_ARRAY
+        elif paramType == 'bool_array':
+            return Parameter.Type.BOOL_ARRAY
+        elif paramType == 'int64_array':
+            return Parameter.Type.INTEGER_ARRAY
+        elif paramType == 'float64_array':
+            return Parameter.Type.DOUBLE_ARRAY
+        elif paramType == 'string_array':
+            return Parameter.Type.STRING_ARRAY
+        else:
+            return Parameter.Type.NOT_SET
         
     async def on_connect(self, websocket, path):
         if self.ws:
@@ -187,6 +216,12 @@ class Ros2FlutterBridge(Node):
                             client.wait_for_server(timeout_sec=1)
                         except Exception as e:
                             await self.ws.send(json.dumps({'op': 'error', 'message': 'Action server not available'}))
+                            await self.ws.send(json.dumps({
+                                'op': 'goal_status',
+                                'goalID': data['tempGoalID'],
+                                'action_server': data['action_server'],
+                                'status': 'aborted',
+                                }))
                         try:
                             future = client.send_goal_async(
                                 goal,
@@ -223,21 +258,54 @@ class Ros2FlutterBridge(Node):
                             if res.return_code != 0:
                                 goal['cancelled'] = False
                             await self.ws.send(json.dumps({
-                                'op': 'action_cancel_response',
-                                'goalID': data['goalID'],
-                                'action_server': data['action_server'],
-                                'success': res.return_code == 0
-                                }))
-                            await self.ws.send(json.dumps({
                                 'op': 'goal_status',
                                 'goalID': data['goalID'],
                                 'action_server': data['action_server'],
                                 'status': 'canceled' if res.return_code == 0 else 'cancel_rejected',
                                 }))
+                            await self.ws.send(json.dumps({
+                                'op': 'action_cancel_response',
+                                'goalID': data['goalID'],
+                                'action_server': data['action_server'],
+                                'success': res.return_code == 0
+                                }))
                         else:
                             await self.ws.send(json.dumps({'op': 'error', 'message': 'Goal exists but has not been accepted yet'}))
                     else:
                         await self.ws.send(json.dumps({'op': 'error', 'message': 'Action client does not exist'}))
+                elif data['op'] == 'set_parameters':
+                    opID = data['opID']
+                    params = data['params']
+                    node_name = data['node_name']
+                    _params = []
+                    for param in params:
+                        _params.append(Parameter(param['name'], self.strToParamType(param['type']), param['value']).to_parameter_msg())
+                    try:
+                        client = self.create_client(SetParameters, f'/{node_name}/set_parameters')
+                        if not client.wait_for_service(timeout_sec=1):
+                            await self.ws.send(json.dumps({'op': 'set_parameters_result', 'opID': opID, 'results': [{'successful': False, 'reason': 'Service not available'}]}))
+                            client.destroy()
+                            return
+                        req = SetParameters.Request()
+                        req.parameters = _params
+                        future = client.call_async(req)
+                        
+                        # while rclpy.ok():
+                        #     rclpy.spin_once(self)
+                        #     if future.done():
+                        #         break
+                        
+                        try:
+                            res = await future
+                            client.destroy()
+                            results = []
+                            for i in range(len(params)):
+                                results.append({'successful': res.results[i].successful, 'reason': res.results[i].reason})
+                            await self.ws.send(json.dumps({'op': 'set_parameters_result', 'opID': opID, 'results': results}))
+                        except Exception as e:
+                            await self.ws.send(json.dumps({'op': 'error', 'message': str(e), 'traceback': format_exc()}))
+                    except Exception as e:
+                        await self.ws.send(json.dumps({'op': 'error', 'message': str(e), 'traceback': format_exc()}))
                 else:
                     self.get_logger().info(f"Unknown operation: {data['op']}")
                     
